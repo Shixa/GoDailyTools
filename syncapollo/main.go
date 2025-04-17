@@ -26,10 +26,8 @@ func GetK8sConfigMap(k8sConfigMap *map[string]string) error {
 	//var kubeconfig string
 	//if home := homedir.HomeDir(); home != "" {
 	//	kubeconfig = filepath.Join(home, ".kube", "config")
-	//} else {
-	//	log.Fatal("找不到家目录")
 	//}
-	kubeconfig := "/root/.kube/config-alpha"
+	kubeconfig := "/path/to/your/kubeconfig"
 
 	// 使用 kubeconfig 创建配置
 	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
@@ -45,8 +43,8 @@ func GetK8sConfigMap(k8sConfigMap *map[string]string) error {
 	}
 
 	// 获取命名空间为 "default" 的名为 "example-configmap" 的 ConfigMap
-	namespace := "test"
-	configMapName := "app-pc-core-test-configmap"
+	namespace := "default"
+	configMapName := "example-configmap"
 	configMap, err := clientset.CoreV1().ConfigMaps(namespace).Get(context.TODO(), configMapName, metav1.GetOptions{})
 	if err != nil {
 		log.Fatalf("无法获取 ConfigMap: %v", err)
@@ -57,7 +55,7 @@ func GetK8sConfigMap(k8sConfigMap *map[string]string) error {
 }
 
 func GetApollo(configMap *map[string]string) error {
-	url := "http://apollo-config.pingcode.live/configfiles/json/PingCode/default/app-pc-core-test-configmap"
+	url := "http://example-apollo-config-server/configfiles/json/YourProject/default/your-configmap"
 	method := "GET"
 
 	client := &http.Client{}
