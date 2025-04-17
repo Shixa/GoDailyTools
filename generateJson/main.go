@@ -57,7 +57,7 @@ func main() {
 		URL:    "",
 		PicURL: "",
 	}
-	domain := "https://config.aiseesoft.com/android-unlocker/win/uninstall/recappicon/"
+	domain := "https://example.com/assets/icons/"
 	for _, row := range productSheet.Rows[1:] {
 		if len(row.Cells) >= 2 { // 确保有足够的单元格
 			language := row.Cells[0].String()
