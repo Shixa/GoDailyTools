@@ -426,9 +426,8 @@ func (c *OSSClient) concurrentUploadDirectory(localDirPath, ossDirPath string, o
 
 		// 等待所有哈希检查完成
 		for range tasks {
-			if task, ok := <-hashDoneChan; ok && !task {
-				// 处理错误
-			}
+			// 只关心接收到信号，不使用具体值
+			<-hashDoneChan
 		}
 
 		hashWg.Wait()
