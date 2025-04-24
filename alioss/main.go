@@ -47,9 +47,20 @@ type uploadTask struct {
 	needCheckHash bool
 }
 
+// DownloadOptions 下载选项
+type DownloadOptions struct {
+	Concurrent  bool // 是否并发下载
+	WorkerCount int  // 并发下载的工作协程数
+}
+
+// ClientOptions 客户端选项
+type ClientOptions struct {
+	ConfigFile string // 配置文件路径
+}
+
 // NewOSSClient 创建一个新的OSS客户端
-func NewOSSClient() (*OSSClient, error) {
-	config, err := loadConfig()
+func NewOSSClient(options *ClientOptions) (*OSSClient, error) {
+	config, err := loadConfig(options)
 	if err != nil {
 		return nil, fmt.Errorf("加载配置失败: %v", err)
 	}
@@ -71,14 +82,27 @@ func NewOSSClient() (*OSSClient, error) {
 	}, nil
 }
 
-// 从用户目录下的.oss-config文件加载配置
-func loadConfig() (OSSConfig, error) {
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		return OSSConfig{}, fmt.Errorf("获取用户目录失败: %v", err)
+// 从配置文件加载配置
+func loadConfig(options *ClientOptions) (OSSConfig, error) {
+	var configPath string
+
+	// 如果指定了配置文件，则使用指定的配置文件
+	if options != nil && options.ConfigFile != "" {
+		configPath = options.ConfigFile
+	} else {
+		// 默认从用户目录下的.oss-config文件加载配置
+		homeDir, err := os.UserHomeDir()
+		if err != nil {
+			return OSSConfig{}, fmt.Errorf("获取用户目录失败: %v", err)
+		}
+		configPath = filepath.Join(homeDir, ".oss-config")
 	}
 
-	configPath := filepath.Join(homeDir, ".oss-config")
+	// 检查配置文件是否存在
+	if _, err := os.Stat(configPath); os.IsNotExist(err) {
+		return OSSConfig{}, fmt.Errorf("配置文件不存在: %s", configPath)
+	}
+
 	data, err := os.ReadFile(configPath)
 	if err != nil {
 		return OSSConfig{}, fmt.Errorf("读取配置文件失败: %v", err)
@@ -87,6 +111,11 @@ func loadConfig() (OSSConfig, error) {
 	var config OSSConfig
 	if err := json.Unmarshal(data, &config); err != nil {
 		return OSSConfig{}, fmt.Errorf("解析配置文件失败: %v", err)
+	}
+
+	// 验证配置是否完整
+	if config.Bucket == "" || config.ID == "" || config.Secret == "" || config.EndPoint == "" {
+		return OSSConfig{}, fmt.Errorf("配置文件不完整，请确保包含bucket、id、secret和endPoint字段")
 	}
 
 	return config, nil
@@ -655,7 +684,12 @@ func shouldExclude(path string, options *UploadOptions) bool {
 }
 
 // DownloadFile 从OSS下载文件到本地
-func (c *OSSClient) DownloadFile(ossPath, localPath string) error {
+func (c *OSSClient) DownloadFile(ossPath, localPath string, options *DownloadOptions) error {
+	// 检查路径是否以斜杠结尾，可能是目录
+	if strings.HasSuffix(ossPath, "/") {
+		return c.DownloadDirectory(ossPath, localPath, options)
+	}
+
 	// 标准化OSS路径，去除前导斜杠
 	ossPath = strings.TrimPrefix(ossPath, "/")
 
@@ -665,9 +699,202 @@ func (c *OSSClient) DownloadFile(ossPath, localPath string) error {
 		localPath = filepath.Join(localPath, filepath.Base(ossPath))
 	}
 
+	// 确保本地目录存在
+	localDir := filepath.Dir(localPath)
+	if err := os.MkdirAll(localDir, 0755); err != nil {
+		return fmt.Errorf("创建本地目录失败: %v", err)
+	}
+
 	err = c.bucket.GetObjectToFile(ossPath, localPath)
 	if err != nil {
 		return fmt.Errorf("下载文件失败: %v", err)
+	}
+
+	return nil
+}
+
+// DownloadDirectory 从OSS下载目录到本地
+func (c *OSSClient) DownloadDirectory(ossPrefix, localPath string, options *DownloadOptions) error {
+	// 标准化OSS路径，去除前导斜杠
+	ossPrefix = strings.TrimPrefix(ossPrefix, "/")
+
+	// 如果OSS前缀不以斜杠结尾，添加斜杠
+	if !strings.HasSuffix(ossPrefix, "/") {
+		ossPrefix += "/"
+	}
+
+	// 确保本地目录存在
+	if err := os.MkdirAll(localPath, 0755); err != nil {
+		return fmt.Errorf("创建本地目录失败: %v", err)
+	}
+
+	// 列出指定前缀的所有文件
+	fmt.Printf("列出OSS目录: %s\n", ossPrefix)
+	files, err := c.ListFiles(ossPrefix)
+	if err != nil {
+		return fmt.Errorf("列举文件失败: %v", err)
+	}
+
+	if len(files) == 0 {
+		return fmt.Errorf("目录为空或不存在: %s", ossPrefix)
+	}
+
+	fmt.Printf("找到 %d 个文件，开始下载...\n", len(files))
+
+	// 如果启用并发下载
+	if options != nil && options.Concurrent {
+		return c.concurrentDownloadFiles(files, ossPrefix, localPath, options.WorkerCount)
+	}
+
+	// 顺序下载
+	for i, ossFile := range files {
+		// 计算相对路径
+		relPath := strings.TrimPrefix(ossFile, ossPrefix)
+		if relPath == "" {
+			continue // 跳过目录本身
+		}
+
+		// 构建本地文件路径
+		localFile := filepath.Join(localPath, filepath.FromSlash(relPath))
+
+		// 确保本地目录存在
+		localDir := filepath.Dir(localFile)
+		if err := os.MkdirAll(localDir, 0755); err != nil {
+			return fmt.Errorf("创建本地目录失败: %v", err)
+		}
+
+		// 下载文件
+		err := c.bucket.GetObjectToFile(ossFile, localFile)
+		if err != nil {
+			return fmt.Errorf("下载文件失败: %v", err)
+		}
+
+		fmt.Printf("[%d/%d] 已下载: %s\n", i+1, len(files), relPath)
+	}
+
+	fmt.Printf("成功下载 %d 个文件到 %s\n", len(files), localPath)
+	return nil
+}
+
+// concurrentDownloadFiles 并发下载多个文件
+func (c *OSSClient) concurrentDownloadFiles(files []string, ossPrefix, localPath string, workerCount int) error {
+	if workerCount <= 0 {
+		workerCount = 10 // 默认10个并发
+	}
+
+	fmt.Printf("使用并发下载模式 (工作协程数: %d)\n", workerCount)
+
+	// 创建下载任务
+	type downloadTask struct {
+		ossFile   string
+		localFile string
+		relPath   string
+		err       error
+	}
+
+	var tasks []*downloadTask
+	for _, ossFile := range files {
+		// 计算相对路径
+		relPath := strings.TrimPrefix(ossFile, ossPrefix)
+		if relPath == "" {
+			continue // 跳过目录本身
+		}
+
+		// 构建本地文件路径
+		localFile := filepath.Join(localPath, filepath.FromSlash(relPath))
+
+		tasks = append(tasks, &downloadTask{
+			ossFile:   ossFile,
+			localFile: localFile,
+			relPath:   relPath,
+		})
+	}
+
+	// 创建下载通道和等待组
+	downloadChan := make(chan *downloadTask, len(tasks))
+	var downloadWg sync.WaitGroup
+
+	// 使用互斥锁保护输出
+	var outputMu sync.Mutex
+
+	// 启动下载协程
+	for i := 0; i < workerCount; i++ {
+		downloadWg.Add(1)
+		go func(id int) {
+			defer downloadWg.Done()
+			for task := range downloadChan {
+				// 确保本地目录存在
+				localDir := filepath.Dir(task.localFile)
+				if err := os.MkdirAll(localDir, 0755); err != nil {
+					task.err = fmt.Errorf("创建本地目录失败: %v", err)
+					outputMu.Lock()
+					fmt.Printf("协程[%d] 错误: %s - %v\n", id, task.relPath, err)
+					outputMu.Unlock()
+					continue
+				}
+
+				// 下载文件
+				err := c.bucket.GetObjectToFile(task.ossFile, task.localFile)
+
+				outputMu.Lock()
+				if err != nil {
+					task.err = fmt.Errorf("下载失败: %v", err)
+					fmt.Printf("协程[%d] 下载失败: %s - %v\n", id, task.relPath, err)
+				} else {
+					fmt.Printf("协程[%d] 已下载: %s\n", id, task.relPath)
+				}
+				outputMu.Unlock()
+			}
+		}(i)
+	}
+
+	// 发送下载任务
+	for _, task := range tasks {
+		downloadChan <- task
+	}
+
+	// 关闭下载通道
+	close(downloadChan)
+
+	// 定期输出进度信息
+	doneChan := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				fmt.Println("下载中，请等待...")
+			case <-doneChan:
+				return
+			}
+		}
+	}()
+
+	// 等待所有下载完成
+	downloadWg.Wait()
+	close(doneChan)
+
+	// 统计结果
+	var successCount, errorCount int
+	for _, task := range tasks {
+		if task.err != nil {
+			errorCount++
+		} else {
+			successCount++
+		}
+	}
+
+	fmt.Printf("\n下载完成: %d 个文件成功", successCount)
+	if errorCount > 0 {
+		fmt.Printf(", %d 个文件失败", errorCount)
+	}
+	fmt.Println()
+
+	// 如果有错误，返回综合错误信息
+	if errorCount > 0 {
+		return fmt.Errorf("部分文件下载失败 (%d/%d)", errorCount, len(tasks))
 	}
 
 	return nil
@@ -770,8 +997,12 @@ func (c *OSSClient) DeleteDirectory(prefix string) error {
 
 func printUsage() {
 	fmt.Println("阿里云OSS工具使用方法:")
+	fmt.Println("全局选项:")
+	fmt.Println("  -f <配置文件路径>        指定配置文件路径，默认为~/.oss-config")
+	fmt.Println("")
+	fmt.Println("命令:")
 	fmt.Println("  上传文件/文件夹: alioss upload <本地文件或文件夹路径> [OSS路径] [--exclude 模式1,模式2,...] [--incremental] [--concurrent [--workers 数量]]")
-	fmt.Println("  下载文件: alioss download <OSS路径> <本地保存路径>")
+	fmt.Println("  下载文件/文件夹: alioss download <OSS路径> <本地保存路径> [--concurrent [--workers 数量]]")
 	fmt.Println("  列出文件: alioss list [前缀]")
 	fmt.Println("  删除文件/文件夹: alioss delete <OSS路径或前缀>")
 	fmt.Println("  获取临时URL: alioss url <OSS路径> [过期时间(秒)，默认3600]")
@@ -783,7 +1014,31 @@ func main() {
 		return
 	}
 
-	client, err := NewOSSClient()
+	// 解析全局选项
+	clientOptions := &ClientOptions{}
+
+	// 查找 -f 选项
+	for i := 1; i < len(os.Args); i++ {
+		if os.Args[i] == "-f" && i+1 < len(os.Args) {
+			clientOptions.ConfigFile = os.Args[i+1]
+
+			// 移除这两个参数，使后面的命令解析更简单
+			if i+2 < len(os.Args) {
+				os.Args = append(os.Args[:i], os.Args[i+2:]...)
+			} else {
+				os.Args = os.Args[:i]
+			}
+			break
+		}
+	}
+
+	// 如果参数被移除后没有足够的参数，则显示帮助
+	if len(os.Args) < 2 {
+		printUsage()
+		return
+	}
+
+	client, err := NewOSSClient(clientOptions)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "错误: %v\n", err)
 		os.Exit(1)
@@ -850,11 +1105,31 @@ func main() {
 		}
 		ossPath := os.Args[2]
 		localPath := os.Args[3]
-		if err := client.DownloadFile(ossPath, localPath); err != nil {
+
+		// 处理下载选项
+		downloadOptions := &DownloadOptions{
+			WorkerCount: 10, // 默认10个工作协程
+		}
+
+		for i := 4; i < len(os.Args); i++ {
+			// 处理并发下载选项
+			if os.Args[i] == "--concurrent" {
+				downloadOptions.Concurrent = true
+			}
+			// 处理工作协程数选项
+			if os.Args[i] == "--workers" && i+1 < len(os.Args) {
+				if _, err := fmt.Sscanf(os.Args[i+1], "%d", &downloadOptions.WorkerCount); err != nil {
+					fmt.Fprintf(os.Stderr, "警告: 无效的工作协程数，使用默认值\n")
+				}
+				i++
+			}
+		}
+
+		if err := client.DownloadFile(ossPath, localPath, downloadOptions); err != nil {
 			fmt.Fprintf(os.Stderr, "下载失败: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Println("文件下载成功!")
+		fmt.Println("下载完成!")
 
 	case "list":
 		prefix := ""

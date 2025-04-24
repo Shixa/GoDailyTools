@@ -22,6 +22,7 @@
 ```bash
 cd alioss
 go build -o alioss
+env GOOS=linux GOARCH=amd64 go build -o alioss-linux-amd64
 ```
 
 然后将可执行文件添加到PATH中，或者直接使用`./alioss`来运行。
