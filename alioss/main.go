@@ -317,6 +317,8 @@ func (c *OSSClient) concurrentUploadDirectory(localDirPath, ossDirPath string, o
 	// 使用互斥锁保护共享变量
 	var mu sync.Mutex
 
+	fmt.Println("正在扫描文件...")
+
 	err := filepath.Walk(localDirPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -384,134 +386,173 @@ func (c *OSSClient) concurrentUploadDirectory(localDirPath, ossDirPath string, o
 
 	fmt.Printf("共扫描到 %d 个文件需要处理\n", len(tasks))
 
-	// 创建任务通道和结果通道
-	taskChan := make(chan *uploadTask, len(tasks))
-	resultChan := make(chan bool, len(tasks))
+	// 检查哈希阶段
+	if options != nil && options.Incremental {
+		fmt.Println("正在检查文件是否需要上传...")
 
-	// 创建工作协程池
-	var wg sync.WaitGroup
+		// 使用单独的通道进行哈希检查
+		hashChan := make(chan *uploadTask, len(tasks))
+		hashDoneChan := make(chan bool, len(tasks))
+
+		// 启动哈希检查协程
+		var hashWg sync.WaitGroup
+		for i := 0; i < workerCount; i++ {
+			hashWg.Add(1)
+			go func(id int) {
+				defer hashWg.Done()
+				for task := range hashChan {
+					needUpload, err := c.needUpload(task.localPath, task.ossPath)
+					if err != nil {
+						task.err = fmt.Errorf("检查文件哈希失败: %v", err)
+						fmt.Printf("协程[%d] 检查错误: %s - %v\n", id, task.ossPath, err)
+					} else {
+						task.needUpload = needUpload
+						if !needUpload {
+							fmt.Printf("协程[%d] 跳过(无变化): %s\n", id, task.ossPath)
+						}
+					}
+					hashDoneChan <- true
+				}
+			}(i)
+		}
+
+		// 发送所有任务进行哈希检查
+		for _, task := range tasks {
+			if task.needCheckHash {
+				hashChan <- task
+			}
+		}
+		close(hashChan)
+
+		// 等待所有哈希检查完成
+		for range tasks {
+			if task, ok := <-hashDoneChan; ok && !task {
+				// 处理错误
+			}
+		}
+
+		hashWg.Wait()
+		close(hashDoneChan)
+
+		// 计算需要上传的文件数
+		var needUploadCount int
+		for _, task := range tasks {
+			if task.needUpload {
+				needUploadCount++
+			}
+		}
+
+		fmt.Printf("需要上传 %d 个文件，跳过 %d 个未变更文件\n",
+			needUploadCount, len(tasks)-needUploadCount)
+
+		// 如果没有文件需要上传，直接返回
+		if needUploadCount == 0 {
+			fmt.Println("所有文件都是最新的，无需上传")
+			return nil
+		}
+	}
+
+	// 上传文件阶段
+	fmt.Println("开始上传文件...")
+
+	// 创建上传通道和等待组
+	uploadChan := make(chan *uploadTask, len(tasks))
+	var uploadWg sync.WaitGroup
+
+	// 使用互斥锁保护输出
+	var outputMu sync.Mutex
+
+	// 启动上传协程
 	for i := 0; i < workerCount; i++ {
-		wg.Add(1)
-		go func(workerID int) {
-			defer wg.Done()
-			c.uploadWorker(taskChan, resultChan, options, workerID)
+		uploadWg.Add(1)
+		go func(id int) {
+			defer uploadWg.Done()
+			for task := range uploadChan {
+				if !task.needUpload {
+					continue
+				}
+
+				// 上传文件
+				ossOptions := []oss.Option{
+					oss.ContentDisposition(fmt.Sprintf("attachment; filename=\"%s\"", filepath.Base(task.localPath))),
+				}
+
+				err := c.bucket.PutObjectFromFile(task.ossPath, task.localPath, ossOptions...)
+
+				outputMu.Lock()
+				if err != nil {
+					task.err = fmt.Errorf("上传失败: %v", err)
+					fmt.Printf("协程[%d] 上传失败: %s - %v\n", id, task.ossPath, err)
+				} else {
+					fmt.Printf("协程[%d] 已上传: %s\n", id, task.ossPath)
+				}
+				outputMu.Unlock()
+			}
 		}(i)
 	}
 
-	// 首先将需要检查哈希的任务放入通道
-	var hashCheckTasks, directUploadTasks []*uploadTask
+	// 发送需要上传的任务
+	uploadCount := 0
 	for _, task := range tasks {
-		if task.needCheckHash {
-			hashCheckTasks = append(hashCheckTasks, task)
-		} else {
-			directUploadTasks = append(directUploadTasks, task)
-		}
-	}
-
-	// 先检查哈希
-	for _, task := range hashCheckTasks {
-		taskChan <- task
-	}
-
-	// 等待哈希检查完成
-	for range hashCheckTasks {
-		<-resultChan
-	}
-
-	// 再上传直接需要上传的文件
-	for _, task := range directUploadTasks {
 		if task.needUpload {
-			taskChan <- task
+			uploadChan <- task
+			uploadCount++
 		}
 	}
 
-	// 再次遍历哈希检查任务，将需要上传的任务放入通道
-	for _, task := range hashCheckTasks {
-		if task.needUpload {
-			task.needCheckHash = false
-			taskChan <- task
+	// 关闭上传通道
+	close(uploadChan)
+
+	// 定期输出进度信息
+	doneChan := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				fmt.Println("上传中，请等待...")
+			case <-doneChan:
+				return
+			}
 		}
-	}
+	}()
 
-	// 关闭任务通道
-	close(taskChan)
-
-	// 等待所有工作协程完成
-	wg.Wait()
+	// 等待所有上传完成
+	uploadWg.Wait()
+	close(doneChan)
 
 	// 统计结果
-	var uploadCount, skipCount, errorCount int
+	var successCount, errorCount, skipCount int
 	for _, task := range tasks {
 		if task.err != nil {
 			errorCount++
 		} else if !task.needUpload {
 			skipCount++
 		} else {
-			uploadCount++
+			successCount++
 		}
 	}
 
-	fmt.Printf("成功上传 %d 个文件到 %s", uploadCount, ossDirPath)
+	fmt.Printf("\n上传完成: %d 个文件成功", successCount)
+	if errorCount > 0 {
+		fmt.Printf(", %d 个文件失败", errorCount)
+	}
 	if excludeCount > 0 {
-		fmt.Printf("，已排除 %d 个文件", excludeCount)
+		fmt.Printf(", %d 个文件被排除", excludeCount)
 	}
 	if skipCount > 0 {
-		fmt.Printf("，已跳过 %d 个无变化文件", skipCount)
-	}
-	if errorCount > 0 {
-		fmt.Printf("，%d 个文件上传失败", errorCount)
+		fmt.Printf(", %d 个文件无变化被跳过", skipCount)
 	}
 	fmt.Println()
 
-	// 如果有错误，返回最后一个错误
-	for _, task := range tasks {
-		if task.err != nil {
-			return fmt.Errorf("部分文件上传失败: %v", task.err)
-		}
+	// 如果有错误，返回综合错误信息
+	if errorCount > 0 {
+		return fmt.Errorf("部分文件上传失败 (%d/%d)", errorCount, uploadCount)
 	}
 
 	return nil
-}
-
-// uploadWorker 工作协程，处理上传任务
-func (c *OSSClient) uploadWorker(taskChan <-chan *uploadTask, resultChan chan<- bool, options *UploadOptions, workerID int) {
-	for task := range taskChan {
-		// 如果需要检查哈希
-		if task.needCheckHash {
-			needUpload, err := c.needUpload(task.localPath, task.ossPath)
-			if err != nil {
-				task.err = fmt.Errorf("检查文件是否需要上传失败: %v", err)
-				task.needUpload = false
-				resultChan <- false
-				continue
-			}
-
-			task.needUpload = needUpload
-			if !needUpload {
-				resultChan <- true
-				continue
-			}
-		}
-
-		// 上传文件
-		ossOptions := []oss.Option{
-			oss.ContentDisposition(fmt.Sprintf("attachment; filename=\"%s\"", filepath.Base(task.localPath))),
-		}
-
-		err := c.bucket.PutObjectFromFile(task.ossPath, task.localPath, ossOptions...)
-		if err != nil {
-			task.err = fmt.Errorf("上传文件 %s 失败: %v", task.localPath, err)
-			if task.needCheckHash {
-				resultChan <- false
-			}
-			continue
-		}
-
-		fmt.Printf("协程[%d] 已上传: %s\n", workerID, task.ossPath)
-		if task.needCheckHash {
-			resultChan <- true
-		}
-	}
 }
 
 // shouldExclude 检查文件是否应该被排除
